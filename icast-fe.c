@@ -191,7 +191,7 @@ static int icast_fe_read_snr(struct dvb_frontend *fe, u16 *snr)
 }
 
 static const struct dvb_frontend_ops icast_dual_mode_fe_ops = {
-	.delsys = { SYS_DTMB, SYS_DVBC_ANNEX_A },
+	.delsys = { SYS_DVBC_ANNEX_A },
 	.info = {
 		.name = "iCast DTMB/DVBC USB demodulator",
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
