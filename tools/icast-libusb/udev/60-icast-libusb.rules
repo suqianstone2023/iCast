@@ -1,0 +1,5 @@
+# SMIT iCast DTMB/DVBC USB dongle - allow access without root.
+#
+# TAG+="uaccess" grants the logged in user access (systemd-logind);
+# the GROUP/MODE line covers headless boxes where nobody is logged in.
+SUBSYSTEM=="usb", ATTR{idVendor}=="29df", ATTR{idProduct}=="0001", MODE="0660", GROUP="plugdev", TAG+="uaccess"

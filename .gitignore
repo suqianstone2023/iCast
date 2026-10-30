@@ -19,3 +19,7 @@ linuxdvb/*.h
 
 # DKMS
 /var/lib/dkms/
+
+# icast-libusb build output
+/tools/icast-libusb/icast-libusb
+/tools/icast-libusb/tests/sink_test

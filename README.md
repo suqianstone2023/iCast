@@ -166,6 +166,27 @@ crw-------    1 root     root      212,   7 May 28 14:42 net0
 
 ---
 
+## 方式三：不装内核模块（用户态 libusb）
+
+内核模块再怎么弄，也一定是"每个内核编一次"。如果连这个都不想要，`tools/icast-libusb/`
+里有一个用户态驱动：直接用 libusb 驱动电视棒，不产生 `/dev/dvb`，**与内核版本完全无关**，
+换内核、换发行版、换 ARM 盒子都能跑。
+
+```bash
+cd tools/icast-libusb
+make && sudo make install
+icast-libusb list
+icast-libusb stream -f 474 -o udp://239.1.1.1:5000
+```
+
+代价是拿不到 `/dev/dvb`：tvheadend 只能把它当 **IPTV 输入**用，而且不能反过来控制调谐
+（一个进程固定一个频点）；VLC、`w_scan`、`dvbv5-tools` 也都用不了。
+
+取舍很明确——**长期当电视后端用内核驱动，临时录制 / 跨平台 / 不能加载模块用这个**。
+详细说明和限制见 [`tools/icast-libusb/README.md`](tools/icast-libusb/README.md)。
+
+---
+
 ## 验证
 
 ```bash
@@ -185,6 +206,8 @@ dmesg | grep -i icast      # 应看到 successfully initialized and connected
 | `Makefile.openwrt` | OpenWrt SDK 交叉编译（上游原文件） |
 | `env.*` | 各架构交叉编译环境变量样例 |
 | `kapi/` | 内核私有头文件副本（本仓库新增） |
+| `dkms.conf`、`install.sh`、`uninstall.sh` | DKMS 安装与卸载（本仓库新增） |
+| `tools/icast-libusb/` | 用户态驱动，不依赖内核（本仓库新增） |
 
 ## 已知问题
 
