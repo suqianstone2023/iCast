@@ -1,0 +1,21 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+*.order
+*.symvers
+Module.symvers
+modules.order
+.tmp_versions/
+
+# OpenWrt cross-compile leftovers
+dl/*.tar.xz
+linuxdvb/*.c
+linuxdvb/*.h
+!linuxdvb/.gitkeep
+!dl/.gitkeep
+
+# DKMS
+/var/lib/dkms/
