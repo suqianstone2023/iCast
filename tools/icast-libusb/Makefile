@@ -22,8 +22,8 @@ endif
 PREFIX  ?= /usr/local
 
 BIN  := icast-libusb
-OBJS := src/icast.o src/sink.o src/smit.o
-TEST := tests/sink_test
+OBJS := src/icast.o src/sink.o src/smit.o src/tsfilter.o
+TEST := tests/sink_test tests/tsfilter_test
 
 all: $(BIN)
 
@@ -35,13 +35,18 @@ src/%.o: src/%.c
 
 src/icast.o src/smit.o: src/smit.h
 src/icast.o src/sink.o tests/sink_test: src/sink.h
+src/icast.o src/sink.o: src/tsfilter.h
 
 # The sink logic is testable without the dongle.
-$(TEST): tests/sink_test.c src/sink.o
-	$(CC) $(CFLAGS) -o $@ tests/sink_test.c src/sink.o
+tests/sink_test: tests/sink_test.c src/sink.o src/tsfilter.o
+	$(CC) $(CFLAGS) -o $@ tests/sink_test.c src/sink.o src/tsfilter.o
+
+tests/tsfilter_test: tests/tsfilter_test.c src/tsfilter.o
+	$(CC) $(CFLAGS) -o $@ tests/tsfilter_test.c src/tsfilter.o
 
 test: $(TEST)
-	./$(TEST)
+	./tests/sink_test
+	./tests/tsfilter_test
 
 install: $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/bin

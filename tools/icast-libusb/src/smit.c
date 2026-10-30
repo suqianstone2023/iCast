@@ -29,6 +29,48 @@
 #define SMIT_CMD_TIMEOUT 500
 #define SMIT_STAT_TIMEOUT 400
 
+/* Runtime debug trace, enabled by -v. Device bring-up depends on undocumented
+ * timing and packet shapes, so being able to see every transfer and its
+ * status is the only practical way to diagnose a dongle that will not answer. */
+int icast_debug;
+
+/* Reset the device before touching it. Enumeration resets the port, so a
+ * dongle that has been sitting enumerated for a long time (typical on a
+ * set-top box that booted hours ago) can have a stale command FIFO. */
+int icast_reset_first;
+
+const char *icast_usb_error(int r)
+{
+	/*
+	 * libusb error codes are 0..-12; anything more negative is an internal
+	 * -errno from this file, and must not be fed to libusb_strerror() or it
+	 * prints a nonsense name ("Other error" for -ETIMEDOUT).
+	 */
+	if (r <= -13)
+		return strerror(-r);
+	if (r < 0) {
+#if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x01000103
+		return libusb_strerror((enum libusb_error)r);
+#else
+		return libusb_error_name(r);
+#endif
+	}
+	return "ok";
+}
+
+static void dbg_bytes(const char *tag, const void *p, int n)
+{
+	const unsigned char *b = p;
+	int i;
+
+	fprintf(stderr, "  [usb] %s", tag);
+	for (i = 0; i < n && i < 12; i++)
+		fprintf(stderr, " %02x", b[i]);
+	if (n > 12)
+		fprintf(stderr, " ...");
+	fprintf(stderr, " (%d bytes)\n", n);
+}
+
 void icast_sleep_ms(int ms)
 {
 	struct timespec ts;
@@ -57,12 +99,30 @@ static int smit_bulk(struct icast_dev *d, unsigned char ep, void *buf, int len,
 	r = libusb_bulk_transfer(d->h, ep, buf, len, &transferred, timeout);
 	if (actual)
 		*actual = transferred;
+
+	if (icast_debug) {
+		fprintf(stderr, "  [usb] bulk ep=0x%02x len=%d tmo=%d -> %d",
+			ep, len, timeout, r);
+		if (r < 0)
+			fprintf(stderr, " (%s, errno=%d)", icast_usb_error(r),
+				errno);
+		fprintf(stderr, " actual=%d\n", transferred);
+		if (r == 0 && transferred > 0)
+			dbg_bytes((ep & 0x80) ? "in " : "out", buf,
+				  (ep & 0x80) ? transferred : len);
+	}
 	return r;
 }
 
 static int smit_control_reset(struct icast_dev *d)
 {
-	return libusb_control_transfer(d->h, 0x40, 0xA0, 0, 0, NULL, 0, 500);
+	int r;
+
+	r = libusb_control_transfer(d->h, 0x40, 0xA0, 0, 0, NULL, 0, 500);
+	if (icast_debug)
+		fprintf(stderr, "  [usb] control req=0xA0 -> %d%s%s\n", r,
+			r < 0 ? " " : "", r < 0 ? icast_usb_error(r) : "");
+	return r;
 }
 
 /*
@@ -117,8 +177,8 @@ static int smit_check(struct icast_dev *d, int checkcount)
  * Send one command: 4 byte header (tag, byte2, req, datalen) followed by the
  * payload, then read the reply back into the same buffer.  Mirrors smit_set().
  */
-static int smit_set(struct icast_dev *d, uint8_t req, const uint8_t *data,
-		    uint8_t len, int need_complete)
+static int smit_set_impl(struct icast_dev *d, uint8_t req, const uint8_t *data,
+			 uint8_t len, int need_complete)
 {
 	struct smit_pack smit;
 	int actual = 0;
@@ -130,6 +190,10 @@ static int smit_set(struct icast_dev *d, uint8_t req, const uint8_t *data,
 	smit.req = req;
 	smit.datalen = len;
 	memcpy(smit.data, data, len);
+
+	if (icast_debug)
+		fprintf(stderr, "  [cmd] set req=0x%02x len=%u complete=%d\n",
+			req, len, need_complete);
 
 	r = smit_bulk(d, SMIT_EP_CMD_SEND, &smit, len + 4, &actual,
 		      SMIT_CMD_TIMEOUT);
@@ -159,6 +223,17 @@ static int smit_set(struct icast_dev *d, uint8_t req, const uint8_t *data,
 	}
 
 	return 0;
+}
+
+static int smit_set(struct icast_dev *d, uint8_t req, const uint8_t *data,
+		    uint8_t len, int need_complete)
+{
+	int r = smit_set_impl(d, req, data, len, need_complete);
+
+	if (icast_debug && r < 0)
+		fprintf(stderr, "  [cmd] set req=0x%02x FAILED -> %d (%s)\n",
+			req, r, icast_usb_error(r));
+	return r;
 }
 
 /*
@@ -316,7 +391,17 @@ static int smit_init(struct icast_dev *d)
 	ret = smit_set(d, 0xA0, cmd9, 32, 100);
 	smit_tuner_stat(d, buf, 20);
 
-	return ret < 0 ? ret : 0;
+	/*
+	 * The kernel driver returns 0 here regardless of how the last commands
+	 * went, and it is right to: a command that never reports completion
+	 * still leaves the tuner initialised, and aborting would discard a
+	 * device that works. Only report it when tracing.
+	 */
+	if (ret < 0 && icast_debug)
+		fprintf(stderr, "  [init] final command did not complete (%d)\n",
+			ret);
+
+	return 0;
 }
 
 static void put_le32(uint8_t *p, uint32_t v)
@@ -386,8 +471,15 @@ int icast_read_status(struct icast_dev *d, struct icast_status *st)
 	if (!st->lock)
 		return 0;
 
-	st->frequency_hz = (uint32_t)buf[16] | ((uint32_t)buf[17] << 8) |
-			   ((uint32_t)buf[18] << 16) | ((uint32_t)buf[19] << 24);
+	/*
+	 * The device reports the locked frequency in kHz, not Hz: 251 MHz comes
+	 * back as 251000. icast_fe_read_status() stores the raw value into a
+	 * field the DVB core reads as Hz, so the kernel driver reports a
+	 * frequency 1000 times too low. Scale it here.
+	 */
+	st->frequency_hz = ((uint32_t)buf[16] | ((uint32_t)buf[17] << 8) |
+			    ((uint32_t)buf[18] << 16) | ((uint32_t)buf[19] << 24)) *
+			   1000u;
 	st->snr_raw = buf[30];
 	st->strength_raw = buf[31];
 
@@ -468,28 +560,24 @@ int icast_count(void)
 	return count;
 }
 
-int icast_open(struct icast_dev *d, int index)
+/*
+ * Scan the bus for the index-th dongle, open it and claim the streaming
+ * interface. d->ctx must already be initialised; on failure d->h stays NULL.
+ */
+static int open_index(struct icast_dev *d, int index)
 {
 	libusb_device **list = NULL;
 	libusb_device *target = NULL;
-	ssize_t n;
+	ssize_t n, i;
 	int seen = 0;
+	int iface;
 	int r;
 
-	memset(d, 0, sizeof(*d));
-	d->iface = -1;
-
-	r = libusb_init(&d->ctx);
-	if (r < 0)
-		return r;
-
 	n = libusb_get_device_list(d->ctx, &list);
-	if (n < 0) {
-		libusb_exit(d->ctx);
+	if (n < 0)
 		return (int)n;
-	}
 
-	for (ssize_t i = 0; i < n; i++) {
+	for (i = 0; i < n; i++) {
 		struct libusb_device_descriptor desc;
 
 		if (libusb_get_device_descriptor(list[i], &desc) != 0)
@@ -504,24 +592,32 @@ int icast_open(struct icast_dev *d, int index)
 
 	if (!target) {
 		libusb_free_device_list(list, 1);
-		libusb_exit(d->ctx);
+		if (icast_debug)
+			fprintf(stderr, "  [usb] no dongle #%d on the bus yet\n", index);
 		return -ENODEV;
 	}
 
-	r = find_stream_interface(target);
-	if (r < 0) {
+	iface = find_stream_interface(target);
+	if (iface < 0) {
 		libusb_free_device_list(list, 1);
-		libusb_exit(d->ctx);
+		if (icast_debug)
+			fprintf(stderr, "  [usb] no streaming interface on dongle\n");
 		return -ENODEV;
 	}
-	d->iface = r;
 
 	r = libusb_open(target, &d->h);
 	libusb_free_device_list(list, 1);
 	if (r < 0) {
-		libusb_exit(d->ctx);
+		if (icast_debug)
+			fprintf(stderr, "  [usb] open failed: %s\n", icast_usb_error(r));
 		return r;
 	}
+
+	d->iface = iface;
+	d->index = index;
+
+	if (icast_debug)
+		fprintf(stderr, "  [usb] opened interface %d\n", d->iface);
 
 	/* Take the interface away from the kernel driver if it is bound. */
 #if defined(__linux__)
@@ -534,13 +630,85 @@ int icast_open(struct icast_dev *d, int index)
 
 	r = libusb_claim_interface(d->h, d->iface);
 	if (r < 0) {
+		if (icast_debug)
+			fprintf(stderr, "  [usb] claim failed: %s (%d)\n",
+				icast_usb_error(r), r);
 		libusb_close(d->h);
-		libusb_exit(d->ctx);
+		d->h = NULL;
 		return r;
 	}
 	d->claimed = 1;
 
+	if (icast_debug)
+		fprintf(stderr, "  [usb] claimed interface %d\n", d->iface);
+
 	return 0;
+}
+
+int icast_open(struct icast_dev *d, int index)
+{
+	int r;
+
+	memset(d, 0, sizeof(*d));
+	d->iface = -1;
+
+	r = libusb_init(&d->ctx);
+	if (r < 0)
+		return r;
+
+	r = open_index(d, index);
+	if (r < 0) {
+		libusb_exit(d->ctx);
+		d->ctx = NULL;
+		return r;
+	}
+
+	if (icast_reset_first)
+		r = icast_soft_reset(d);
+
+	return r;
+}
+
+/*
+ * The dongle answers one init sequence and is then unresponsive to further
+ * handshakes - not just for the rest of the process, but across a replug as
+ * well. The 0xA0 vendor request is what brings it back: the chip resets itself
+ * and re-enumerates, so the handle has to be reopened afterwards.
+ */
+int icast_soft_reset(struct icast_dev *d)
+{
+	int attempt;
+	int r = 0;
+
+	if (d->h) {
+		r = libusb_control_transfer(d->h, 0x40, 0xA0, 0, 0, NULL, 0, 500);
+		/* The transfer usually fails with an I/O error because the device
+		 * disappears mid-request. That is the expected outcome. */
+		if (icast_debug)
+			fprintf(stderr, "  [usb] vendor reset 0xA0 -> %s\n",
+				r < 0 ? icast_usb_error(r) : "ok");
+
+		if (d->claimed)
+			libusb_release_interface(d->h, d->iface);
+		libusb_close(d->h);
+		d->h = NULL;
+		d->claimed = 0;
+	}
+
+	icast_sleep_ms(2000);
+
+	for (attempt = 1; attempt <= 15; attempt++) {
+		r = open_index(d, d->index);
+		if (r == 0) {
+			if (icast_debug)
+				fprintf(stderr, "  [usb] device back after %d ms\n",
+					attempt * 400);
+			return 0;
+		}
+		icast_sleep_ms(400);
+	}
+
+	return r;
 }
 
 void icast_close(struct icast_dev *d)
@@ -565,15 +733,54 @@ int icast_init(struct icast_dev *d)
 {
 	uint8_t hs[4] = { 0xFE, 0x00, 0x10, 0x00 };
 	int actual = 0;
-	int r;
+	int r = 0;
+	int attempt;
+	int pass;
 
-	r = smit_bulk(d, SMIT_EP_CMD_SEND, hs, 4, &actual, SMIT_CMD_TIMEOUT);
+	if (icast_debug)
+		fprintf(stderr, "  [init] probe handshake 0xFE 0x00 0x10 0x00\n");
+
+	/*
+	 * The probe handshake is the one step that fails transiently: right
+	 * after a reset or a replug the firmware is not ready yet and the first
+	 * transfer times out even though the device is fine a moment later.
+	 * Retry a few times before giving up.
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		for (attempt = 1; attempt <= 4; attempt++) {
+			r = smit_bulk(d, SMIT_EP_CMD_SEND, hs, 4, &actual,
+				      SMIT_CMD_TIMEOUT);
+			if (r == 0)
+				r = smit_bulk(d, SMIT_EP_CMD_RECV, hs, 4,
+					      &actual, SMIT_CMD_TIMEOUT);
+			if (r == 0)
+				break;
+			if (icast_debug)
+				fprintf(stderr,
+					"  [init] handshake attempt %d failed: %s\n",
+					attempt, icast_usb_error(r));
+			icast_sleep_ms(400);
+		}
+		if (r == 0)
+			break;
+		/*
+		 * Silence here usually means the firmware already served a
+		 * session and will not answer again until it is reset, which
+		 * a replug does not achieve either. Reset it and try once more.
+		 */
+		if (pass == 0) {
+			if (icast_debug)
+				fprintf(stderr, "  [init] no reply, resetting device\n");
+			if (icast_soft_reset(d) < 0)
+				break;
+		}
+	}
+
 	if (r < 0)
 		return r;
 
-	r = smit_bulk(d, SMIT_EP_CMD_RECV, hs, 4, &actual, SMIT_CMD_TIMEOUT);
-	if (r < 0)
-		return r;
+	if (icast_debug)
+		fprintf(stderr, "  [init] handshake answered\n");
 
 	r = smit_init(d);
 	if (r < 0) {

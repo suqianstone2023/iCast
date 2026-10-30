@@ -91,7 +91,7 @@ static void test_file_alignment(void)
 		return;
 	}
 
-	rc = sink_open(&s, path);
+	rc = sink_open(&s, path, NULL);
 	CHECK(rc == 0, "sink_open(%s)", path);
 
 	for (off = 0; off < total; off += 97) {
@@ -171,7 +171,7 @@ static void test_udp_datagram_size(void)
 	}
 
 	snprintf(addr, sizeof(addr), "udp://127.0.0.1:%d", port);
-	CHECK(sink_open(&s, addr) == 0, "sink_open(%s)", addr);
+	CHECK(sink_open(&s, addr, NULL) == 0, "sink_open(%s)", addr);
 
 	total = build_stream(in, 0, packets);
 	for (off = 0; off < total; off += 53) {
@@ -206,10 +206,88 @@ static void test_udp_datagram_size(void)
 	      "bytes on the wire: %llu", bytes);
 }
 
+/*
+ * The device hands over up to 128 KB per bulk read, so a single sink_write()
+ * call can hold a whole buffer of packets. Sending that as one datagram fails
+ * with EMSGSIZE - which is exactly what happened on the first real capture.
+ */
+static void test_udp_bulk_write(void)
+{
+	const size_t packets = 100;
+	uint8_t in[100 * TS_PACKET];
+	uint8_t rx[4096];
+	char addr[64];
+	struct sockaddr_in me;
+	socklen_t mlen = sizeof(me);
+	int sock, port, rc;
+	unsigned long long bytes = 0;
+	int datagrams = 0;
+	int too_big = 0;
+	struct sink s;
+	size_t total;
+
+	printf("udp output, %zu packets in one write:\n", packets);
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		printf("  FAIL socket\n");
+		failures++;
+		return;
+	}
+
+	memset(&me, 0, sizeof(me));
+	me.sin_family = AF_INET;
+	me.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (bind(sock, (struct sockaddr *)&me, sizeof(me)) < 0 ||
+	    getsockname(sock, (struct sockaddr *)&me, &mlen) < 0) {
+		printf("  FAIL bind\n");
+		failures++;
+		close(sock);
+		return;
+	}
+	port = ntohs(me.sin_port);
+
+	{
+		struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
+
+	snprintf(addr, sizeof(addr), "udp://127.0.0.1:%d", port);
+	CHECK(sink_open(&s, addr, NULL) == 0, "sink_open(%s)", addr);
+
+	total = build_stream(in, 0, packets);
+	rc = sink_write(&s, in, total);
+	CHECK(rc == 0, "one %zu byte write succeeds (got %d)", total, rc);
+
+	for (;;) {
+		ssize_t r = recv(sock, rx, sizeof(rx), 0);
+
+		if (r <= 0)
+			break;
+		datagrams++;
+		bytes += (unsigned long long)r;
+		if ((size_t)r > TS_DATAGRAM_PACKETS * TS_PACKET)
+			too_big++;
+		if (rx[0] != 0x47)
+			too_big++;
+	}
+
+	sink_close(&s);
+	close(sock);
+
+	/* 100 packets = 14 whole 1316 byte groups, 376 bytes left buffered. */
+	CHECK(datagrams == 14, "split into 14 datagrams (got %d)", datagrams);
+	CHECK(too_big == 0, "no datagram exceeds 1316 bytes and all start with 0x47");
+	CHECK(bytes == 14ull * TS_DATAGRAM_PACKETS * TS_PACKET,
+	      "bytes on the wire: %llu", bytes);
+}
+
 int main(void)
 {
 	test_file_alignment();
 	test_udp_datagram_size();
+	test_udp_bulk_write();
 
 	if (failures) {
 		printf("\n%d check(s) failed\n", failures);
@@ -218,3 +296,6 @@ int main(void)
 	printf("\nall checks passed\n");
 	return 0;
 }
+
+/* sink.c reports its target when this is set; the tests do not need it. */
+int icast_debug;

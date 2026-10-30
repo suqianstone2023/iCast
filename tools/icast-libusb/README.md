@@ -91,6 +91,8 @@ icast-libusb stream -f 474 -o udp://239.1.1.1:5000
 -m, --qam N          DVBC 星座：16/32/64/128/256（默认 64）
 -b, --bandwidth MHZ  DTMB 带宽（默认 8）
 -o, --out TARGET     '-' 表示 stdout，或文件路径，或 udp://host:port
+                     可重复，每个 -o 都拿到完整复用
+-p, --program N=URL  只输出第 N 个节目（PAT 会重写成单节目），可重复
 -M, --monitor        调谐后持续打印状态
 -t, --seconds N      运行 N 秒后退出
 -q, --quiet          不往 stderr 打状态行
@@ -101,6 +103,75 @@ icast-libusb stream -f 474 -o udp://239.1.1.1:5000
 ```bash
 icast-libusb stream -f 474 -o - | ffmpeg -i - -c copy out.mp4
 ```
+
+## 一个节目一路输出（机顶盒、单频道录制）
+
+一个频点上的节目是打包在一起的，整路复用几千万 bit/s 里大部分是你不看的那几套。
+`-p` 把某一路节目单独切出来，并且**重写 PAT**（只留这一个节目，CRC 重新算），
+下游拿到的就是一条干净的单节目流：
+
+```bash
+# 先看有几个节目、各自的节目号
+icast-libusb stream -C -f 251 -o /tmp/mux.ts -t 5
+python3 -c "
+import sys; b=open('/tmp/mux.ts','rb').read()
+i=0
+while i+188<=len(b):
+    p=b[i:i+188]
+    if p[0]==0x47 and (((p[1]&0x1f)<<8)|p[2])==0 and (p[1]&0x40) and p[5]==0:
+        j=8
+        while j+4<=3+(((p[6]&0xf)<<8)|p[7])-4:
+            print('program', (p[j]<<8)|p[j+1], 'pmt 0x%04x' % (((p[j+2]&0x1f)<<8)|p[j+3])); j+=4
+        break
+    i+=188"
+
+# 每个节目一路，各自一个端口
+icast-libusb -C -f 251 stream \
+    -p 220=udp://127.0.0.1:5001 \
+    -p 221=udp://127.0.0.1:5002 \
+    -p 222=udp://127.0.0.1:5003
+```
+
+为什么要切：整路复用交给机顶盒的解复用器时，它要按峰值码率留缓冲，很容易在
+preroll 阶段就卡住；单节目流的码率只有五分之一，稳定得多。顺带也解决了
+"一路复用里挑一个节目播"这件事——每个端口就是一台频道。
+
+`tests/tsfilter_test.c` 用手工构造的 PAT/PMT 覆盖了这段逻辑（含 PAT 重写与 CRC 校验），
+`make test` 一起跑。
+
+## 电视棒解不出来的情况：加扰
+
+有线/卫星上很多频点是**条件接收（CA）加密**的。TS 头里有两个 bit 标着
+`transport_scrambling_control`，非 0 就表示这一段负载是密文。电视棒的固件不做解扰，
+也没有 CI/CAM 通道，所以：
+
+- 节目表、节目名、PID 全都正常读得出来（PAT/PMT 是明文）
+- 播放器能拿到数据、能列出频道，但**永远黑屏**
+- 收下来的 TS 里码流连续性也是好的，看不出毛病
+
+先确认一下再怀疑代码：
+
+```bash
+ffprobe -hide_banner udp://127.0.0.1:5001     # 能看到节目 = 表正常
+# 数一下加扰包：非 0 就是加密的
+python3 - <<'EOF'
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",5001)); s.settimeout(5)
+b=bytearray()
+while len(b)<400000:
+    try: b+=s.recvfrom(65536)[0]
+    except socket.timeout: break
+i=t=c=0
+while i+188<=len(b):
+    if b[i]==0x47:
+        t+=1; c+=1 if (b[i+3]>>6)&3 else 0
+    i+=188
+print("scrambled %d/%d" % (c,t))
+EOF
+```
+
+明文频点这个比例应该是 0。这条路上唯一能播的是运营商没加密的节目，
+或者把卡插进带 CI 槽的机器用它的调谐器去解。
 
 ## 接 tvheadend
 

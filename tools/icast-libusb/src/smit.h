@@ -27,6 +27,7 @@
 struct icast_dev {
 	libusb_context *ctx;
 	libusb_device_handle *h;
+	int index;         /* which dongle on the bus this handle refers to */
 	int iface;
 	int claimed;
 	int dtmb;          /* device reported DTMB support during init */
@@ -47,6 +48,19 @@ struct icast_status {
  * does not exist on some targets, so everything uses nanosleep internally. */
 void icast_sleep_ms(int ms);
 
+/* When non-zero, every USB transfer, command and status lookup is traced to
+ * stderr. Set by -v on the command line. */
+extern int icast_debug;
+
+/* When non-zero, icast_open() issues a USB device reset before claiming the
+ * interface. Needed on hosts where the dongle sat enumerated for a long time
+ * without a driver ever talking to it. */
+extern int icast_reset_first;
+
+/* Human readable name for a libusb error code, with a fallback for libusb
+ * builds that predate libusb_strerror(). */
+const char *icast_usb_error(int r);
+
 /* Number of iCast dongles currently attached. */
 int icast_count(void);
 
@@ -57,6 +71,14 @@ void icast_close(struct icast_dev *d);
 
 /* Probe handshake + full init sequence. Must be called after icast_open(). */
 int icast_init(struct icast_dev *d);
+
+/* Put the firmware back into a state where it answers the probe handshake.
+ *
+ * The dongle answers exactly one init sequence and then goes quiet: a second
+ * handshake, even after a replug, gets no reply until the 0xA0 vendor request
+ * is issued. That request makes the chip reset itself, which also drops it off
+ * the bus, so this reopens the device and reclaims the interface. */
+int icast_soft_reset(struct icast_dev *d);
 
 /* Tune. dvbc != 0 selects the DVBC path, otherwise the DTMB path.
  * freq_hz is the centre frequency in Hz, symbol_rate in Sym/s, qam is the
