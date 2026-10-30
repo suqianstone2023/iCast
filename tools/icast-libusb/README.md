@@ -33,6 +33,32 @@ make
 sudo make install     # 装到 /usr/local/bin，并（以 root 运行时）安装 udev 规则
 ```
 
+### 交叉编译（ARM 盒子 / Enigma2 等）
+
+代码只依赖 libusb 和 libc99，交叉编译没有任何额外步骤。静态链接 musl 后得到
+一个不依赖目标机 libc 的单文件，直接 scp 到设备就能跑：
+
+```bash
+# 1. 交叉 libusb（静态）
+CC=/path/to/aarch64-linux-musl-gcc /path/to/libusb-1.0.27/configure \
+    --host=aarch64-linux-musl --disable-udev --enable-static --disable-shared \
+    --prefix=/tmp/libusb-a64 && make -j && make install
+
+# 2. 本工具（静态）
+make clean
+make CC=/path/to/aarch64-linux-musl-gcc \
+     LIBUSB_CFLAGS="-I/tmp/libusb-a64/include/libusb-1.0" \
+     LIBUSB_LIBS="/tmp/libusb-a64/lib/libusb-1.0.a -static"
+```
+
+`LIBUSB_LIBS` 末尾的 `-static` 生成 static-pie 单文件（aarch64 约 650 KB）。
+armv7hf（`arm-linux-musleabihf`）同理。已验证两个架构均零 warning 编出。
+
+Enigma2（OpenBH / OpenATV 等）机顶盒没有内核 headers、厂商内核也拿不到源码配置，
+是这种用法最典型的场景：盒子本地跑 `stream -o udp://127.0.0.1:5000`，
+在 E2 里以 4097（IPTV）服务类型播放 `udp://@127.0.0.1:5000` 即可，
+不需要动固件、不需要装内核模块。
+
 ## 使用
 
 ```bash
