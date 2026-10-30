@@ -17,6 +17,8 @@ dvb-usb-icast-fe-objs   := smit.o icast-fe.o
 dvb-usb-icast-smit-objs := smit.o icast-smit.o
 
 ccflags-y += -I$(src)/kapi
+# Warn when the kernel is outside the range the vendored header was verified for.
+ccflags-y += -include $(src)/kapi/kapi-guard.h
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

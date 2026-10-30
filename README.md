@@ -90,11 +90,25 @@ sudo make install
 | `kapi/dvb-usb.h` | `drivers/media/usb/dvb-usb/dvb-usb.h` |
 | `kapi/dvb-pll.h` | `drivers/media/dvb-frontends/dvb-pll.h` |
 
-当前副本取自 **v6.8**。注意 `dvb-usb.h` 里仍然 `#include "dvb-pll.h"`，而该文件在 6.x 已经
+当前副本取自 **v6.16**。注意 `dvb-usb.h` 里仍然 `#include "dvb-pll.h"`，而该文件在 6.x 已经
 从 `usb/dvb-usb/` 挪到了 `dvb-frontends/`，取的时候别找错目录。
 
-> **跨大版本升级内核（如 6.8 → 6.11）时必须同步替换这两个头文件**，否则
-> `struct dvb_usb_adapter` / `struct dvb_usb_device` 布局可能与内核不一致。
+**这份头文件不需要随内核升级而更换**：`struct dvb_usb_adapter` / `struct dvb_usb_device`
+的成员布局在 **v5.15 ~ v6.16** 之间完全一致（v6.13 只是给 `cold_ids` / `warm_ids` /
+`i2c_algo` 加了 `const`，不改变任何成员的偏移）。实测把 v6.16 的头文件放到 v6.8 内核上
+编译，产物正常。
+
+`kapi/kapi-guard.h` 会在内核超出这个范围时给出编译告警：
+
+```
+warning: kernel is newer than v6.16; re-check struct layout in kapi/dvb-usb.h ...
+```
+
+看到这条告警不代表不能用，但**必须先去核对新内核的 `dvb-usb.h` 结构体是否仍然一致**——
+布局错位不会编译失败，只会静默踩内存。
+
+> 真正跨大版本（比如 6.17+ 或 5.10）时，最省事的验证方式是直接换上新内核源码里的那份
+> `dvb-usb.h` 编一遍；能不能过编译 + 布局有没有变，一测就知道。
 
 ---
 
