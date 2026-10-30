@@ -1,0 +1,60 @@
+# Out-of-tree build for Enigma2 receivers on the vendor 4.4.35 kernel.
+#
+# Target: GigaBlue gbmv200 / Hi3798MV200, ARCH=arm,
+#         cortexa15hf-neon-vfpv4, 32-bit armv7l.
+#
+# How this differs from the two Makefiles already in the tree:
+#
+#   Makefile.openwrt  rebuilds dvb-core / dvb-usb / dvb_usb_v2 from the
+#                     vendored linuxdvb/ sources.  On this receiver those
+#                     three are built into the kernel (CONFIG_DVB_CORE=y,
+#                     CONFIG_DVB_USB=y), so loading a second copy of them
+#                     fails with duplicate symbols.
+#
+#   Makefile (native) builds only the two iCast modules against the
+#                     framework the kernel already provides, which is what
+#                     we want -- but it points ccflags at kapi/, whose
+#                     dvb-usb.h is a verbatim copy of v6.16.  That copy is
+#                     only verified for v5.15 .. v6.16, and a struct
+#                     layout mismatch does not fail the build, it corrupts
+#                     memory at run time.
+#
+# Here we keep the native link-against-the-kernel strategy and drop kapi/:
+# the header comes from the 4.4.35 source tree itself, so the layout is
+# guaranteed to match the kernel that will load the module.
+#
+# Prerequisites on the build host:
+#   KDIR  - a 4.4.35 tree configured with the receiver's defconfig and
+#           prepared with `make modules_prepare`
+#   CROSS_COMPILE - an armv7 hard-float toolchain
+#
+# Usage:
+#   make -f Makefile.e2 KDIR=~/e2build/linux-4.4.35 \
+#        CROSS_COMPILE=arm-linux-
+
+obj-m += dvb-usb-icast-fe.o
+obj-m += dvb-usb-icast-smit.o
+
+dvb-usb-icast-fe-objs   := smit.o icast-fe.o
+dvb-usb-icast-smit-objs := smit.o icast-smit.o
+
+KDIR ?= $(HOME)/e2build/linux-4.4.35
+CROSS_COMPILE ?= arm-linux-
+
+# 4.4 keeps both headers inside the tree; dvb-usb.h is private to
+# drivers/media/usb/dvb-usb and is not installed by linux-headers.
+# dvb-usb.h also includes "dvb-pll.h", which on 4.4 still lives under
+# dvb-frontends/ (it only moved to tuners/ in later kernels) -- so we get
+# the real header here instead of the kapi/ stand-in.
+ccflags-y += -I$(KDIR)/drivers/media/usb/dvb-usb
+ccflags-y += -I$(KDIR)/drivers/media/dvb-core
+ccflags-y += -I$(KDIR)/drivers/media/dvb-frontends
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm CROSS_COMPILE=$(CROSS_COMPILE) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f *.ko *.o *.mod.c *.order *.symvers
+
+.PHONY: all clean

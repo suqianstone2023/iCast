@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SMIT iCast DTMB/DVC driver
+ * SMIT iCast DTMB/DVBC driver
  *
  * Copyright (C) 2026 Xiaodong Ni <nxiaodong520@gmail.com>
  */
@@ -36,9 +36,19 @@ struct icast_state {
 static int icast_fe_init(struct dvb_frontend *fe)
 {
 	struct icast_state *priv = fe->demodulator_priv;
-	
-	priv->frequency = 0;
-	priv->symbol_rate = 0;
+
+	if (!priv->dev)
+		return -ENODEV;
+
+	/*
+	 * Drop the cached signal state so the first read_status() after a
+	 * tune does not report the strength of the previous transponder.
+	 * The tuned frequency is kept: E2 reads it back while building its
+	 * transponder list, and zeroing it there only makes it guess.
+	 */
+	priv->lock = 0;
+	priv->strength = 0;
+	priv->snr = 0;
 
 	return 0;
 }
@@ -50,15 +60,41 @@ static void icast_fe_release(struct dvb_frontend *fe)
 	kfree(state);
 }
 
-static int icast_fe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_properties *props)
+/*
+ * get_frontend changed signature in v4.7: up to v4.6 it took only the
+ * frontend and was expected to fill fe->dtv_property_cache; from v4.7 on it
+ * is handed the properties blob to fill.
+ *
+ * Getting this wrong is nearly silent at build time -- a single
+ * "incompatible pointer type" warning -- but at run time the kernel calls a
+ * two-argument function through a one-argument pointer, so the callback
+ * dereferences whatever happened to be in the second register.  On 4.4.35
+ * that is exactly the kind of thing that turns a frontend query into an
+ * oops inside the caller's context.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
+static int icast_fe_get_frontend(struct dvb_frontend *fe)
 {
   struct icast_state *priv = fe->demodulator_priv;
 
   fe->dtv_property_cache.frequency = priv->frequency;
   fe->dtv_property_cache.symbol_rate = priv->symbol_rate;
+  fe->dtv_property_cache.modulation = priv->modulation;
 
   return 0;
 }
+#else
+static int icast_fe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_properties *props)
+{
+  struct icast_state *priv = fe->demodulator_priv;
+
+  props->frequency = priv->frequency;
+  props->symbol_rate = priv->symbol_rate;
+  props->modulation = priv->modulation;
+
+  return 0;
+}
+#endif
 
 #define DWORD_TO_BYTES(dword, bytes, position) \
   bytes[position] = (u8)(dword & 0xFF); \
@@ -66,6 +102,13 @@ static int icast_fe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_pr
   bytes[position+2] = (u8)((dword>>16) & 0xFF); \
   bytes[position+3] = (u8)((dword>>24) & 0xFF);
 
+/*
+ * The tuner command block.  Offsets that matter:
+ *   16..19  frequency in kHz, little endian
+ *   20..23  symbol rate in kS/s, little endian
+ *   24..27  QAM order (16/32/64/128/256) for DVB-C
+ *   28..31  bandwidth, DTMB only
+ */
 static int icast_fe_set_frontend(struct dvb_frontend *fe)
 {
   u8 cmd9[32] = {
@@ -73,19 +116,23 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   	0x17,	0x00, 0x00, 0x14, 0x00, 0x03, 0x00, 0x10,
   	0xB8,	0xF3, 0x03, 0x00, 0xDB, 0x1A, 0x00, 0x00,
   	0x40,	0x00, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00
-  }; 
-  u8 buf[900];
+  };
+  u8 buf[300];
   u32 frequency, symbol_rate;
   struct icast_state *priv = fe->demodulator_priv;
+  int ret;
+
+  if (!priv->dev)
+    return -ENODEV;
 
 	frequency = (u32)(fe->dtv_property_cache.frequency / 1000);
   DWORD_TO_BYTES(frequency, cmd9, 16);
-  
+
   if ( fe->dtv_property_cache.delivery_system == SYS_DVBC_ANNEX_A)
   {
 		symbol_rate = (u32)(fe->dtv_property_cache.symbol_rate / 1000);
     DWORD_TO_BYTES(symbol_rate, cmd9, 20);
-    
+
     switch ( fe->dtv_property_cache.modulation )
     {
       case QAM_16:
@@ -104,19 +151,38 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
       	DWORD_TO_BYTES(256, cmd9, 24);
         break;
       default:
+      	/*
+      	 * QAM_AUTO and friends: keep the value the init sequence left
+      	 * in the block (64) instead of writing zero, which the firmware
+      	 * reads as "no demodulation configured".
+      	 */
         break;
     }
   }
-  else
+  else if ( fe->dtv_property_cache.delivery_system == SYS_DVBT )
   {
   	DWORD_TO_BYTES(0, cmd9, 20);
     DWORD_TO_BYTES(0, cmd9, 24);
     DWORD_TO_BYTES(8, cmd9, 28);
   }
+  else
+  {
+    return -EINVAL;
+  }
 
-  smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
+  memset(buf, 0, sizeof(buf));
 
-  smit_tuner_stat(priv->dev->udev, buf, 2);
+  ret = smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
+  if (ret)
+    return ret;
+
+  /*
+   * One status read right after the tune: it drains whatever the firmware
+   * still had queued for the previous transponder, and it makes the lock
+   * flag meaningful for callers that poll status before the first timeout.
+   */
+  if (smit_tuner_stat(priv->dev->udev, buf, 2) >= 32)
+    priv->lock = buf[29] ? 1 : 0;
 
   priv->frequency = fe->dtv_property_cache.frequency;
   priv->symbol_rate = fe->dtv_property_cache.symbol_rate;
@@ -142,40 +208,72 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   	0x0B, 0x01, 0x00, 0x08, 0x00, 0x05, 0x00, 0x04,
   	0x47, 0x53, 0x54, 0x41
   };
-  u8 buf[900];
+  u8 buf[300];
+  int ret;
 
-  smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50);
+  *status = 0;
 
-  if ( smit_tuner_stat(priv->dev->udev, buf, 5) != 32 )
-  {
+  if (!priv->dev)
+    return -ENODEV;
+
+  memset(buf, 0, sizeof(buf));
+
+  ret = smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50);
+  if (ret)
+    return ret;
+
+  ret = smit_tuner_stat(priv->dev->udev, buf, 5);
+  if (ret < 0)
+    return ret;
+
+  /*
+   * Anything shorter than the full 32 byte status block means the firmware
+   * answered "busy": the tune is still settling, so report "no lock yet"
+   * rather than reading whatever is left in the buffer.
+   */
+  if (ret < 32) {
+    priv->lock = 0;
     return 0;
   }
-  priv->lock = (u8)buf[29];
 
-  if ( buf[29] == 0 )
-  {
-    *status = 0;
-  }
-  else
-  {
-    *status = FE_HAS_SIGNAL | FE_HAS_LOCK;
+  priv->lock = buf[29] ? 1 : 0;
 
-		priv->frequency = (buf[19]<<24) + (buf[18]<<16) + (buf[17]<<8) + buf[16];
-    priv->snr = (u8)buf[30];
-    priv->strength = (u8)buf[31];
-//    printk("buf[30]=%02X buf[31]=%02X", buf[30], buf[31]);
-  }
+  if (!priv->lock)
+    return 0;
+
+  /*
+   * The dongle reports a single lock bit.  Everything below it in the
+   * status hierarchy is implied once it is set -- without carrier and
+   * synchroniser there would be no lock at all -- and E2's tuner screens
+   * use the whole set to decide whether an SNR/strength reading is worth
+   * showing.
+   */
+  *status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
+            FE_HAS_SYNC | FE_HAS_LOCK;
+
+  /* buf[16..19] is the locked frequency in kHz; the cache is in Hz. */
+  priv->frequency = ((u32)buf[19] << 24 | (u32)buf[18] << 16 |
+                     (u32)buf[17] << 8 | (u32)buf[16]) * 1000;
+  priv->snr = buf[30];
+  priv->strength = buf[31];
+
   return 0;
+}
+
+/*
+ * The firmware hands out a 0..100 percentage; the DVB API wants 0..0xffff.
+ * The original expression open-coded the same scaling as a magic multiply.
+ */
+static u16 icast_scale_percent(u8 raw)
+{
+  return (u16)(((u32)raw * 0xffffu) / 100u);
 }
 
 static int icast_fe_read_signal_strength(struct dvb_frontend *fe, u16 *strength)
 {
   struct icast_state *priv = fe->demodulator_priv;
 
-  *strength = 0;
-  if ( priv->lock )
-    *strength = ((s64)((u64)(90070618176225 * (u8)priv->strength) >> 32) >> 5)
-              - (0xFFFF * (u8)priv->strength >> 31);
+  *strength = priv->lock ? icast_scale_percent(priv->strength) : 0;
   return 0;
 }
 
@@ -183,25 +281,54 @@ static int icast_fe_read_snr(struct dvb_frontend *fe, u16 *snr)
 {
   struct icast_state *priv = fe->demodulator_priv;
 
-  *snr = 0;
-  if ( priv->lock )
-    *snr = ((s64)((u64)(90070618176225 * (u8)priv->snr) >> 32) >> 5)
-         - (0xFFFF * (u8)priv->snr >> 31);
+  *snr = priv->lock ? icast_scale_percent(priv->snr) : 0;
   return 0;
 }
 
+/*
+ * The dongle does not expose pre/post RS error counts over this protocol.
+ * Providing the callbacks anyway keeps the frontend from answering -ENOSYS,
+ * which some E2 signal screens treat as "frontend gone".
+ */
+static int icast_fe_read_ber(struct dvb_frontend *fe, u32 *ber)
+{
+  *ber = 0;
+  return 0;
+}
+
+static int icast_fe_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
+{
+  *ucblocks = 0;
+  return 0;
+}
+
+/*
+ * .info.type is not filled in by dvb-core: FE_GET_INFO returns whatever the
+ * driver left there, and the enum starts at 0, so a driver that never sets
+ * it reports FE_QPSK.
+ *
+ * That is not cosmetic.  E2's eDVBUsbAdapter switches on fe_info.type to
+ * label the tuner (FE_QAM -> "DVB-C", FE_QPSK -> "DVB-S2") and bails out on
+ * anything it does not know, so an unset type makes a cable stick show up
+ * as a satellite tuner the user cannot use.
+ */
 static const struct dvb_frontend_ops icast_dual_mode_fe_ops = {
 	.delsys = { SYS_DVBT, SYS_DVBC_ANNEX_A },
 	.info = {
 		.name = "iCast DTMB/DVBC USB demodulator",
+		.type = FE_OFDM,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
 		.frequency_min = 47000000,
 		.frequency_max = 862000000,
 		.frequency_stepsize = 10000,
+		.symbol_rate_min = 1000000,
+		.symbol_rate_max = 10000000,
 #else
 		.frequency_min_hz	= 47 * MHz,
 		.frequency_max_hz	= 862 * MHz,
 		.frequency_stepsize_hz	= 10 * kHz,
+		.symbol_rate_min = 1000000,
+		.symbol_rate_max = 10000000,
 #endif
 		.caps =
 			FE_CAN_FEC_AUTO |
@@ -218,20 +345,35 @@ static const struct dvb_frontend_ops icast_dual_mode_fe_ops = {
 	.read_status = icast_fe_read_status,
 	.read_signal_strength = icast_fe_read_signal_strength,
 	.read_snr = icast_fe_read_snr,
+	.read_ber = icast_fe_read_ber,
+	/*
+	 * read_ucblocks was renamed read_uncorrected_blocks in v4.11.  The
+	 * callback signature is identical, only the member name moved.
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	.read_ucblocks = icast_fe_read_ucblocks,
+#else
+	.read_uncorrected_blocks = icast_fe_read_ucblocks,
+#endif
 };
 
 static const struct dvb_frontend_ops icast_single_mode_fe_ops = {
 	.delsys = { SYS_DVBC_ANNEX_A },
 	.info = {
 		.name = "iCast DVBC USB demodulator",
+		.type = FE_QAM,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
 		.frequency_min = 47000000,
 		.frequency_max = 862000000,
 		.frequency_stepsize = 10000,
+		.symbol_rate_min = 1000000,
+		.symbol_rate_max = 10000000,
 #else
 		.frequency_min_hz	= 47 * MHz,
 		.frequency_max_hz	= 862 * MHz,
 		.frequency_stepsize_hz	= 10 * kHz,
+		.symbol_rate_min = 1000000,
+		.symbol_rate_max = 10000000,
 #endif
 		.caps =
 			FE_CAN_FEC_AUTO |
@@ -248,6 +390,16 @@ static const struct dvb_frontend_ops icast_single_mode_fe_ops = {
 	.read_status = icast_fe_read_status,
 	.read_signal_strength = icast_fe_read_signal_strength,
 	.read_snr = icast_fe_read_snr,
+	.read_ber = icast_fe_read_ber,
+	/*
+	 * read_ucblocks was renamed read_uncorrected_blocks in v4.11.  The
+	 * callback signature is identical, only the member name moved.
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	.read_ucblocks = icast_fe_read_ucblocks,
+#else
+	.read_uncorrected_blocks = icast_fe_read_ucblocks,
+#endif
 };
 
 struct dvb_frontend *icast_fe_attach(struct dvb_usb_adapter *adap, const struct icast_fe_config *config)
@@ -257,7 +409,7 @@ struct dvb_frontend *icast_fe_attach(struct dvb_usb_adapter *adap, const struct 
 	priv = kzalloc(sizeof(struct icast_state), GFP_KERNEL);
 	if (priv == NULL)
 		return NULL;
-	
+
   if (config->dtmb)
   {
   	memcpy(&priv->frontend.ops, &icast_dual_mode_fe_ops, sizeof(struct dvb_frontend_ops));
@@ -266,10 +418,10 @@ struct dvb_frontend *icast_fe_attach(struct dvb_usb_adapter *adap, const struct 
   {
   	memcpy(&priv->frontend.ops, &icast_single_mode_fe_ops, sizeof(struct dvb_frontend_ops));
   }
-	
+
 	priv->frontend.demodulator_priv = priv;
 	priv->dev = adap->dev;
-	
+
 	return &priv->frontend;
 }
 
@@ -278,4 +430,3 @@ EXPORT_SYMBOL_GPL(icast_fe_attach);
 MODULE_DESCRIPTION("iCast frontend driver");
 MODULE_AUTHOR("Xiaodong Ni <nxiaodong520@gmail.com>");
 MODULE_LICENSE("GPL");
-

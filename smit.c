@@ -9,11 +9,11 @@
 #include "smit.h"
 
 struct st_smit_pack {
-	char tag;
-	char byte2;
-	char req;
-	char datalen;
-	char data[1000];
+	u8 tag;
+	u8 byte2;
+	u8 req;
+	u8 datalen;
+	u8 data[1000];
 } typedef SMIT_PACK;
 
 int smit_usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data, int len, int *actual_length, int timeout)
@@ -40,13 +40,25 @@ int smit_reset(struct usb_device *udev)
   return usb_control_msg(udev, usb_sndctrlpipe(udev, 0), 160, 64, 0, 0, 0, 0, 500);
 }
 
+/*
+ * Upper bound on how long smit_check() may spin waiting for a "complete"
+ * flag.  The caller's checkcount is authoritative on the number of retries,
+ * but the sleep between them grows with the retry index, so the vendor
+ * argument of 300 could keep a caller (and, with a synchronous probe, khubd)
+ * blocked for close to a minute on a wedged MCU.  Giving up early just means
+ * the command is reported as incomplete, which is what actually happened.
+ */
+#define SMIT_CHECK_MAX_MS 3000
+
 int smit_check(struct usb_device *udev, int checkcount)
 {
   int cnt;
   int ret;
   int actual_length;
+  unsigned long deadline;
 
   cnt = 0;
+  deadline = jiffies + msecs_to_jiffies(SMIT_CHECK_MAX_MS);
 
   while ( 1 )
   {
@@ -79,6 +91,8 @@ int smit_check(struct usb_device *udev, int checkcount)
     if ( cnt > checkcount )
       break;
     msleep((unsigned int)(cnt / 2 + 3));
+    if ( time_after(jiffies, deadline) )
+      break;
   }
   return -checkcount;
 }
@@ -176,9 +190,31 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   	0x00,	0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
   }; 
   u8 cmd14[20] = { 0x01, 0x90, 0x02, 0x00, 0x03, 0x9F, 0x9A, 0x07, 0x0B, 0x07, 0x00, 0x08, 0x10, 0x07, 0x00, 0x04, 0x47, 0x44, 0x48, 0x57};
-  u8 buf[1000];
+  u8 buf[512];
+  int ret;
 
-  smit_set(udev, 0x82, cmd0, 1, 100);
+  /*
+   * The DTMB probe at the end does strstr(buf + 18, "DTMB:Y").  Every
+   * smit_tuner_stat() only copies as many bytes as the device reported, so
+   * on a failed or short reply buf would still hold uninitialised stack
+   * with no terminator and strstr would walk off the end of it.
+   */
+  memset(buf, 0, sizeof(buf));
+
+  /*
+   * The first command of the handshake is the one that tells the MCU "start
+   * talking to me".  If it fails there is no point in walking the remaining
+   * two dozen commands: the firmware answers this exactly once per power
+   * cycle, so a failure here means either a wedged MCU or a second init.
+   * Report it instead of returning success and registering a tuner that can
+   * never lock.
+   */
+  ret = smit_set(udev, 0x82, cmd0, 1, 100);
+  if (ret)
+  {
+    printk(KERN_ERR "icast: init handshake rejected (%d)\n", ret);
+    return ret;
+  }
   smit_tuner_stat(udev, buf, 0);
 
   smit_set(udev, 0xA0, cmd3, 10, 0);
