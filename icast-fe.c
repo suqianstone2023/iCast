@@ -191,15 +191,15 @@ static int icast_fe_read_snr(struct dvb_frontend *fe, u16 *snr)
 }
 
 static const struct dvb_frontend_ops icast_dual_mode_fe_ops = {
-	.delsys = { SYS_DVBT, SYS_DVBC_ANNEX_A },
+	.delsys = { SYS_DTMB, SYS_DVBC_ANNEX_A },
 	.info = {
 		.name = "iCast DTMB/DVBC USB demodulator",
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
-		.frequency_min = 10000000,
+		.frequency_min = 47000000,
 		.frequency_max = 862000000,
 		.frequency_stepsize = 10000,
 #else
-		.frequency_min_hz	= 10 * MHz,
+		.frequency_min_hz	= 47 * MHz,
 		.frequency_max_hz	= 862 * MHz,
 		.frequency_stepsize_hz	= 10 * kHz,
 #endif
@@ -225,11 +225,11 @@ static const struct dvb_frontend_ops icast_single_mode_fe_ops = {
 	.info = {
 		.name = "iCast DVBC USB demodulator",
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
-		.frequency_min = 10000000,
+		.frequency_min = 47000000,
 		.frequency_max = 862000000,
 		.frequency_stepsize = 10000,
 #else
-		.frequency_min_hz	= 10 * MHz,
+		.frequency_min_hz	= 47 * MHz,
 		.frequency_max_hz	= 862 * MHz,
 		.frequency_stepsize_hz	= 10 * kHz,
 #endif
