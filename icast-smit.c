@@ -11,6 +11,7 @@
 #include <linux/version.h>
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
+#include <linux/string.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -33,6 +34,25 @@ static bool smit_async = true;
 module_param(smit_async, bool, 0644);
 MODULE_PARM_DESC(smit_async,
 	"initialise the dongle from a workqueue instead of probe context (default: true)");
+
+/*
+ * A dual-mode stick answers "DTMB:Y" in its capability string, and the
+ * frontend then advertises FE_OFDM.  Enigma2 switches on fe_info.type to
+ * label a USB tuner (FE_QAM -> "DVB-C", FE_OFDM -> "DVB-T"), and a cable
+ * operator's bouquet cannot be attached to a DVB-T tuner, so on a stick
+ * that is only ever used on cable the label has to be FE_QAM.
+ *
+ * This only overrides what FE_GET_INFO reports.  smit_init() still runs
+ * with the mode the hardware reports, because that flag decides whether
+ * the vendor init sequence sends cmd10/cmd11 (the single-mode cable
+ * switch); flipping it would change how the dongle behaves rather than
+ * just how it is labelled.  set_frontend() already dispatches on the
+ * delivery system, so cable tuning works either way.
+ */
+static char *icast_mode = "auto";
+module_param(icast_mode, charp, 0444);
+MODULE_PARM_DESC(icast_mode,
+	"frontend type: auto (as reported by the dongle), dvbc (FE_QAM), dtmb (FE_OFDM)");
 
 /*
  * The MCU answers the initialisation handshake exactly once per power cycle
@@ -198,6 +218,7 @@ static int smit_hello(struct usb_device *udev)
 static bool smit_do_init(struct smit_dev *sd)
 {
 	struct usb_device *udev = sd->udev;
+	u8 hw_dtmb = 0;
 	int ret;
 
 	mutex_lock(&smit_lock);
@@ -208,13 +229,27 @@ static bool smit_do_init(struct smit_dev *sd)
 		goto fail;
 	}
 
-	ret = smit_init(udev, &icast_config.dtmb);
+	ret = smit_init(udev, &hw_dtmb);
 	if (ret) {
 		info("smit_init failed (%d)", ret);
 		goto fail;
 	}
 
-	info("dongle initialised, %s mode", icast_config.dtmb ? "DTMB" : "DVB-C");
+	/*
+	 * What the hardware can do, versus what the frontend claims to be.
+	 * The hardware flag is what smit_init() just acted on; the frontend
+	 * flag is what E2 reads back from FE_GET_INFO.
+	 */
+	icast_config.dtmb = hw_dtmb;
+	if (!strcmp(icast_mode, "dvbc"))
+		icast_config.dtmb = 0;
+	else if (!strcmp(icast_mode, "dtmb"))
+		icast_config.dtmb = 1;
+
+	info("dongle initialised, hardware=%s frontend=%s (icast_mode=%s)",
+	     hw_dtmb ? "DTMB" : "DVB-C",
+	     icast_config.dtmb ? "DTMB/FE_OFDM" : "DVB-C/FE_QAM",
+	     icast_mode);
 
 	ret = dvb_usb_device_init(sd->intf, &icast_properties, THIS_MODULE,
 				  NULL, adapter_nr);
