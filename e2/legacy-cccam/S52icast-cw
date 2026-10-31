@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# iCast DVB-C dongle -> CCcam descrambler -> HTTP MPEG-TS server.
+#
+# Enigma2 is started by inittab (gui:3:respawn:/usr/bin/enigma2.sh) *after*
+# rcS finishes, so anything started here is already listening when E2 boots and
+# auto-tunes the last service.  We still poll for the TCP port so the service
+# is guaranteed to answer before rcS returns.
+#
+DAEMON=/home/root/icast/icast_cw.py
+PORT=8110
+HEXPORT=1FAE          # 0x1FAE == 8110
+LOG=/tmp/icast-cw.log
+
+# The dongle is opened exclusively: the CLI child must die together with the
+# python parent, otherwise it keeps "Resource busy" for every later attempt.
+pid_of() {
+	for p in /proc/[0-9]*; do
+		case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in
+			*python3*icast_cw.py*) echo "${p#/proc/}" ;;
+		esac
+	done
+	for p in /proc/[0-9]*; do
+		[ "$(cat "$p/comm" 2>/dev/null)" = "icast-cli" ] && echo "${p#/proc/}"
+	done
+	return 0
+}
+
+port_up() {
+	# /proc/net/tcp: field 2 = local addr:port (hex), field 4 = st (0A = LISTEN)
+	awk -v h="$HEXPORT" 'NR>1 { n=split($2,a,":"); if (a[n]==h && $4=="0A") { f=1; exit } }
+		END { exit(f?0:1) }' /proc/net/tcp
+}
+
+case "$1" in
+start)
+	[ -f "$DAEMON" ] || exit 0
+	port_up && exit 0
+	echo "=== $(date '+%F %T') rcS start ===" >>"$LOG"
+	setsid python3 "$DAEMON" --port "$PORT" >>"$LOG" 2>&1 </dev/null &
+	i=0
+	while [ $i -lt 60 ]; do
+		port_up && break
+		i=$((i + 1))
+		sleep 0.5
+	done
+	port_up && echo "$(date '+%F %T') port $PORT ready" >>"$LOG" \
+	       || echo "$(date '+%F %T') port $PORT NOT ready" >>"$LOG"
+	;;
+stop)
+	for p in $(pid_of); do kill "$p" 2>/dev/null; done
+	i=0
+	while [ $i -lt 20 ]; do
+		[ -z "$(pid_of)" ] && break
+		i=$((i + 1))
+		sleep 0.25
+	done
+	for p in $(pid_of); do kill -9 "$p" 2>/dev/null; done
+	sleep 1
+	;;
+restart)
+	"$0" stop
+	sleep 2
+	"$0" start
+	;;
+status)
+	if port_up; then
+		echo "icast-cw listening on $PORT"
+	else
+		echo "icast-cw not running"
+		return 3 2>/dev/null || exit 3
+	fi
+	;;
+*)
+	echo "usage: $0 {start|stop|restart|status}"
+	exit 1
+	;;
+esac

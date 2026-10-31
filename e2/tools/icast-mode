@@ -1,0 +1,149 @@
+#!/bin/sh
+# icast-mode - switch the SMIT iCast stick between DVB-C and DTMB / DVB-T.
+#
+# The stick carries ONE demodulator, so exactly one mode can be active at a
+# time, and enigma2 reads the frontend type only once at startup.  OpenBH's
+# eDVBUsbAdapter also hard-codes frontend0, so the box can never show two
+# tuners for this stick - the mode is always a choice, never a both.
+#
+# The choice is stored in /etc/icast.mode and picked up by
+# /usr/bin/icast-boot.sh on the next boot.
+#
+# usage:
+#   icast-mode                    show configured / running mode
+#   icast-mode dvbc               switch to DVB-C  (reboots, 10 s grace)
+#   icast-mode dtmb               switch to DTMB / DVB-T (reboots, 10 s grace)
+#   icast-mode dvbc --warm        try a warm reload instead of rebooting
+#   icast-mode dvbc --no-reboot   only store it, apply on next boot
+
+CONF=/etc/icast.mode
+MODDIR=/lib/modules/$(uname -r)/extra
+GRACE=10
+
+log() {
+	echo "$*"
+}
+
+running_mode() {
+	if [ -r /sys/module/dvb_usb_icast_smit/parameters/icast_mode ]; then
+		cat /sys/module/dvb_usb_icast_smit/parameters/icast_mode 2>/dev/null
+	else
+		echo "(driver not loaded)"
+	fi
+}
+
+configured_mode() {
+	if [ -r "$CONF" ]; then
+		cat "$CONF" 2>/dev/null
+	else
+		echo "dvbc (default)"
+	fi
+}
+
+e2_running() {
+	ps 2>/dev/null | grep -q "[e]nigma2"
+}
+
+# Reload both modules together.  Never reload dvb-usb-icast-fe on its own:
+# smit keeps the old frontend pointing into it, and vtunerc's frontend
+# thread then calls smit_set() through a stale pointer -> kernel oops.
+warm_switch() {
+	want=$1
+	log "stopping enigma2 ..."
+	killall enigma2 2>/dev/null
+	i=0
+	while [ $i -lt 20 ]; do
+		e2_running || break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	log "unloading driver ..."
+	rmmod dvb_usb_icast_smit 2>/dev/null
+	rmmod dvb_usb_icast_fe 2>/dev/null
+	if [ -e /sys/module/dvb_usb_icast_smit ] || [ -e /sys/module/dvb_usb_icast_fe ]; then
+		log "modules still in use (vtunerc / a leftover demux holds them)"
+		return 1
+	fi
+
+	sleep 4
+	log "loading driver in $want mode ..."
+	insmod "$MODDIR/dvb-usb-icast-fe.ko" || return 1
+	sleep 1
+	insmod "$MODDIR/dvb-usb-icast-smit.ko" icast_mode="$want" || return 1
+
+	i=0
+	while [ $i -lt 45 ]; do
+		[ -e /dev/dvb/adapter1/frontend0 ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	if [ ! -e /dev/dvb/adapter1/frontend0 ]; then
+		log "adapter1/frontend0 did not appear"
+		return 1
+	fi
+
+	log "frontend ready, restarting enigma2 ..."
+	i=0
+	while [ $i -lt 30 ]; do
+		e2_running && break
+		sleep 2
+		i=$((i + 2))
+	done
+	return 0
+}
+
+do_reboot() {
+	log ""
+	log "enigma2 reads the tuner type once at boot, so the box must restart."
+	log "Rebooting in ${GRACE} s - press Ctrl-C to cancel."
+	i=$GRACE
+	while [ $i -gt 0 ]; do
+		printf "\r  %2d " "$i"
+		sleep 1
+		i=$((i - 1))
+	done
+	printf "\r\n"
+	sync
+	reboot
+}
+
+MODE=$1
+OPT=$2
+
+case "$MODE" in
+	""|status|show)
+		log "configured : $(configured_mode)"
+		log "running    : $(running_mode)"
+		log ""
+		log "usage: icast-mode dvbc|dtmb [--warm|--no-reboot]"
+		exit 0
+		;;
+	dvbc|dtmb)
+		;;
+	*)
+		log "unknown mode '$MODE' (expected dvbc or dtmb)"
+		exit 2
+		;;
+esac
+
+echo "$MODE" > "$CONF"
+log "stored /etc/icast.mode = $MODE"
+
+case "$OPT" in
+	--no-reboot)
+		log "takes effect on next boot (icast-boot.sh reads $CONF)"
+		exit 0
+		;;
+	--warm)
+		if warm_switch "$MODE"; then
+			log "switched to $MODE without a reboot"
+			exit 0
+		fi
+		log "warm switch failed, falling back to a reboot"
+		do_reboot
+		;;
+	*)
+		do_reboot
+		;;
+esac

@@ -1,0 +1,82 @@
+#!/bin/sh
+#
+# iCast keep-alive for Enigma2.
+#
+#!! IMPORTANT: rcS runs every /etc/rcS.d/S* script *synchronously*, and enigma2
+#!! is only started from inittab after rcS returns.  Anything that waits in the
+#!! foreground here therefore delays or deadlocks the whole boot.  `start` must
+#!! fork the worker and return immediately; the worker is a separate process.
+#
+# The worker watches for "Enigma2 is on our service but nothing is connected to
+# the stream port" (dead player - zapping to the already active service is a
+# no-op for E2) and forces a real re-tune by selecting the alternate reference
+# of the same stream.
+#
+BASE=4097%3A0%3A1%3A0%3A0%3A0%3A0%3A0%3A0%3A0%3Ahttp%253a%2F%2F127.0.0.1%253a8110%2Fstream
+ALT=4097%3A0%3A1%3A0%3A0%3A0%3A0%3A0%3A0%3A0%3Ahttp%253a%2F%2F127.0.0.1%253a8110%2Fstream2
+HEXPORT=1FAE
+LOG=/var/log/icast-watch.log
+
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+established() {
+	awk -v h="$HEXPORT" 'NR>1 { n=split($2,a,":"); if (a[n]==h && $4=="01") { f=1; exit } }
+		END { exit(f?0:1) }' /proc/net/tcp
+}
+
+worker() {
+	# Enigma2 can take minutes to come up on this box; wait as long as needed.
+	# This runs in its own process, so it can never hold up the boot.
+	until wget -q -O /dev/null "http://127.0.0.1/web/about" 2>/dev/null; do
+		sleep 5
+	done
+	log "watchdog online"
+
+	fails=0
+	while true; do
+		sleep 45
+
+		cur=$(wget -q -O - "http://127.0.0.1/web/getcurrent" 2>/dev/null)
+		[ -z "$cur" ] && continue
+		case "$cur" in
+			*8110/stream2*) target=$BASE ;;
+			*8110/stream*)  target=$ALT  ;;
+			*) fails=0; continue ;;          # user watches something else
+		esac
+
+		established && { fails=0; continue; }
+
+		fails=$((fails + 1))
+		log "on iCast but no client (strike $fails)"
+		[ $fails -lt 2 ] && continue
+
+		fails=0
+		log "forcing re-tune"
+		wget -q -O /dev/null "http://127.0.0.1/web/zap?sRef=$target" || log "zap failed"
+		sleep 45
+	done
+}
+
+case "$1" in
+start)
+	for p in /proc/[0-9]*; do
+		[ "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" = "$0 worker " ] && exit 0
+	done
+	setsid "$0" worker </dev/null >/dev/null 2>&1 &
+	;;
+worker)
+	worker
+	;;
+stop)
+	for p in /proc/[0-9]*; do
+		case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in
+			*S53icast-watch*worker*) kill "${p#/proc/}" 2>/dev/null ;;
+		esac
+	done
+	;;
+*)
+	echo "usage: $0 {start|stop}"
+	;;
+esac
+
+exit 0

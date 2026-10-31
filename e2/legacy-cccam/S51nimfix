@@ -1,0 +1,6 @@
+#!/bin/sh
+# Keep the iCast USB tuner advertised as DVB-C on NIM socket 2.
+# The vendor module clones the built-in Si2166D template, so the socket
+# table has to be overridden before Enigma2 scans it.
+[ -f /etc/enigma2/nimfix/nim_sockets ] || exit 0
+mount --bind /etc/enigma2/nimfix/nim_sockets /proc/bus/nim_sockets 2>/dev/null
