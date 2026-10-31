@@ -37,6 +37,7 @@ adapter1/frontend0 (iCast, 我们的驱动)
 | `tools/v3tune.c` | 最早的调谐试验品 |
 | `tools/ICastMode/` | 早期插件，只负责在界面里把 tuner 显示成 DVB-C |
 | `legacy-cccam/` | 抛弃的老方案：icast-cli 出流 + CCcam 解扰 + HTTP 推给 E2，留作参考 |
+| `legacy-iptv/` | 更早的方案：用户态驱动 + 单节目 UDP，E2 当 IPTV 播，已弃用 |
 
 ## 部署
 
