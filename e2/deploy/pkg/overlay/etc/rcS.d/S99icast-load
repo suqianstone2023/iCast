@@ -1,0 +1,32 @@
+#!/bin/sh
+# 开机加载 iCast 电视棒驱动。
+#
+# 只做一件事：把两个模块装进内核。放后台跑，绝不前台等待 ——
+# /etc/init.d/rc 是串行执行 rcS.d 的 S* 脚本的，enigma2 由 inittab 在
+# rcS 返回之后才拉起来，这里凡是阻塞一下整机就起不来了（教训换来的）。
+#
+# 驱动加载后 USB 枚举是异步的，E2 起得太快没看到 tuner 的话，
+# 重启一次 GUI 就有了。
+
+case "$1" in
+start)
+	MODDIR="/lib/modules/$(uname -r)/extra/icast"
+	(
+		modprobe dvb_usb_icast_fe 2>/dev/null || insmod "$MODDIR/dvb-usb-icast-fe.ko"
+		modprobe dvb_usb_icast_smit 2>/dev/null ||
+			insmod "$MODDIR/dvb-usb-icast-smit.ko" icast_mode=dvbc
+	) >/tmp/icast-load.log 2>&1 &
+	;;
+stop)
+	rmmod dvb_usb_icast_smit 2>/dev/null
+	rmmod dvb_usb_icast_fe 2>/dev/null
+	;;
+restart|status)
+	[ -d /sys/module/dvb_usb_icast_smit ] && echo "loaded" || echo "not loaded"
+	;;
+*)
+	echo "usage: $0 {start|stop|status}"
+	exit 1
+	;;
+esac
+exit 0
