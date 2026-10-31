@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/version.h>
+#include <linux/delay.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -22,6 +23,20 @@
 
 //#define CONFIG_DYNAMIC_DEBUG
 
+/*
+ * Runtime diagnostics.  The frontend side had no logging at all, which made
+ * "Enigma2 tuned but never saw a lock" impossible to tell apart from
+ * "the tune never reached the dongle".  dbg=1 turns the trace on at runtime:
+ *
+ *   echo 1 > /sys/module/dvb_usb_icast_fe/parameters/dbg
+ */
+static int dbg;
+module_param(dbg, int, 0644);
+MODULE_PARM_DESC(dbg, "log frontend ioctl parameters and results (0/1)");
+
+#define DLOG(fmt, ...) \
+	do { if (dbg) printk(KERN_INFO "icast-fe: " fmt, ##__VA_ARGS__); } while (0)
+
 struct icast_state {
 	struct dvb_usb_device *dev;
   struct dvb_frontend frontend;
@@ -31,6 +46,18 @@ struct icast_state {
   u8 lock;
   u8 strength;
   u16 snr;
+  u32 dbg_calls;
+  u8  dbg_last_lock;
+  int dbg_stat_len;
+  /*
+   * The kernel's frontend thread calls read_status() on its own schedule,
+   * while Enigma2 calls FE_READ_STATUS / FE_SET_FRONTEND from the ioctl
+   * path.  Both walk the same pair of bulk endpoints, and the dongle has a
+   * single command channel: without this lock the request and the reply of
+   * two concurrent sequences interleave and the status block comes back
+   * truncated, which reads as "no lock" even though the tuner is locked.
+   */
+  struct mutex io_lock;
 };
 
 static int icast_fe_init(struct dvb_frontend *fe)
@@ -125,6 +152,14 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   if (!priv->dev)
     return -ENODEV;
 
+  DLOG("set_frontend: ds=%d freq=%u sr=%u mod=%d\n",
+       (int)fe->dtv_property_cache.delivery_system,
+       (unsigned)fe->dtv_property_cache.frequency,
+       (unsigned)fe->dtv_property_cache.symbol_rate,
+       (int)fe->dtv_property_cache.modulation);
+
+  mutex_lock(&priv->io_lock);
+
 	frequency = (u32)(fe->dtv_property_cache.frequency / 1000);
   DWORD_TO_BYTES(frequency, cmd9, 16);
 
@@ -167,26 +202,41 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   }
   else
   {
+    DLOG("set_frontend: unsupported delivery system %d\n",
+         (int)fe->dtv_property_cache.delivery_system);
+    mutex_unlock(&priv->io_lock);
     return -EINVAL;
   }
 
   memset(buf, 0, sizeof(buf));
 
   ret = smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
-  if (ret)
+  if (ret) {
+    DLOG("set_frontend: smit_set failed ret=%d\n", ret);
+    mutex_unlock(&priv->io_lock);
     return ret;
+  }
 
   /*
    * One status read right after the tune: it drains whatever the firmware
    * still had queued for the previous transponder, and it makes the lock
    * flag meaningful for callers that poll status before the first timeout.
+   * Start from "not locked": the previous transponder's state must not leak
+   * into the new one, and a short reply here means we simply don't know yet.
    */
+  priv->lock = 0;
   if (smit_tuner_stat(priv->dev->udev, buf, 2) >= 32)
     priv->lock = buf[29] ? 1 : 0;
+
+  DLOG("set_frontend: accepted, freq_khz=%u sr_ksps=%u post_tune_lock=%d\n",
+       (unsigned)(frequency), (unsigned)(fe->dtv_property_cache.symbol_rate / 1000),
+       (int)priv->lock);
 
   priv->frequency = fe->dtv_property_cache.frequency;
   priv->symbol_rate = fe->dtv_property_cache.symbol_rate;
   priv->modulation = fe->dtv_property_cache.modulation;
+
+  mutex_unlock(&priv->io_lock);
 
   return 0;
 }
@@ -200,7 +250,7 @@ static int icast_fe_get_tune_settings(struct dvb_frontend *fe,
 	return 0;
 }
 
-static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
+static int icast_fe_read_status_raw(struct dvb_frontend *fe, enum fe_status *status)
 {
   struct icast_state *priv = fe->demodulator_priv;
   u8 cmd12[20] = {
@@ -209,37 +259,62 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   	0x47, 0x53, 0x54, 0x41
   };
   u8 buf[300];
-  int ret;
+  int ret, i;
 
   *status = 0;
 
   if (!priv->dev)
     return -ENODEV;
 
+  mutex_lock(&priv->io_lock);
+
   memset(buf, 0, sizeof(buf));
 
   ret = smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50);
-  if (ret)
+  if (ret) {
+    priv->dbg_stat_len = -1000 + ret;
+    mutex_unlock(&priv->io_lock);
     return ret;
+  }
 
   ret = smit_tuner_stat(priv->dev->udev, buf, 5);
-  if (ret < 0)
+  if (ret < 0) {
+    priv->dbg_stat_len = -2000 + ret;
+    mutex_unlock(&priv->io_lock);
     return ret;
+  }
 
   /*
-   * Anything shorter than the full 32 byte status block means the firmware
-   * answered "busy": the tune is still settling, so report "no lock yet"
-   * rather than reading whatever is left in the buffer.
+   * A short answer is the firmware saying "no new status yet", not "unlocked".
+   * It shows up right after a tune and while the TS pump is starting, and
+   * treating it as "lost lock" makes Enigma2 abort the scan: it retunes, the
+   * retune restarts the settling window, and every attempt dies the same way.
+   * Give the MCU a couple of chances, then keep the last known state -- the
+   * dongle reports a real unlock as a full 32 byte block with bit 29 clear.
    */
+  for (i = 0; ret < 32 && i < 3; i++) {
+    msleep(10);
+    ret = smit_tuner_stat(priv->dev->udev, buf, 5);
+    if (ret < 0) {
+      priv->dbg_stat_len = -2000 + ret;
+      mutex_unlock(&priv->io_lock);
+      return ret;
+    }
+  }
+
+  priv->dbg_stat_len = ret;
+
   if (ret < 32) {
-    priv->lock = 0;
+    mutex_unlock(&priv->io_lock);
     return 0;
   }
 
   priv->lock = buf[29] ? 1 : 0;
 
-  if (!priv->lock)
+  if (!priv->lock) {
+    mutex_unlock(&priv->io_lock);
     return 0;
+  }
 
   /*
    * The dongle reports a single lock bit.  Everything below it in the
@@ -257,7 +332,34 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   priv->snr = buf[30];
   priv->strength = buf[31];
 
+  mutex_unlock(&priv->io_lock);
+
   return 0;
+}
+
+/*
+ * Logging wrapper.  Enigma2 polls status once per tune cycle and the kernel's
+ * frontend thread polls it too, so an unconditional printk would flood the
+ * log; every eighth call plus every lock transition is enough to follow what
+ * the tuner is doing.
+ */
+static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
+{
+  struct icast_state *priv = fe->demodulator_priv;
+  int ret = icast_fe_read_status_raw(fe, status);
+
+  if (dbg) {
+    priv->dbg_calls++;
+    if (ret < 0 || priv->lock != priv->dbg_last_lock ||
+        !(priv->dbg_calls & 7)) {
+      printk(KERN_INFO "icast-fe: read_status #%u ret=%d lock=%d status=0x%x stat_len=%d\n",
+             (unsigned)priv->dbg_calls, ret, (int)priv->lock,
+             (unsigned)*status, priv->dbg_stat_len);
+      priv->dbg_last_lock = priv->lock;
+    }
+  }
+
+  return ret;
 }
 
 /*
@@ -421,6 +523,7 @@ struct dvb_frontend *icast_fe_attach(struct dvb_usb_adapter *adap, const struct 
 
 	priv->frontend.demodulator_priv = priv;
 	priv->dev = adap->dev;
+	mutex_init(&priv->io_lock);
 
 	return &priv->frontend;
 }
