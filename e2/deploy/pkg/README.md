@@ -83,3 +83,8 @@ modprobe dvb_usb_icast_fe && modprobe dvb_usb_icast_smit
 
 驱动和扫描器的源码、踩坑记录在仓库 `e2/` 目录：
 <https://github.com/suqianstone2023/iCast>
+
+打好的成品 tar.gz 不放 main（main 只进源码），在仓库的 **`e2` 分支**
+`e2/deploy/releases/` 下，直接下载即可：
+
+<https://github.com/suqianstone2023/iCast/tree/e2/e2/deploy/releases>
