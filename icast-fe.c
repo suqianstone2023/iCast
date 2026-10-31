@@ -60,6 +60,37 @@ struct icast_state {
   struct mutex io_lock;
 };
 
+/*
+ * Un-stall the transport-stream endpoint before anyone submits an URB to it.
+ *
+ * dvb-usb stops the stream with usb_urb_kill() and never clears a halt it
+ * leaves behind; the iCast firmware keeps pushing data until the host drains
+ * the pipe, so killing the URBs stalls the bulk IN endpoint rather than
+ * stopping the device.  The next dvb_usb_ctrl_feed() then calls
+ * usb_urb_submit() -- and ignores its return value -- so it counts a feed
+ * that is not actually running.  The tuner still reports FE_HAS_LOCK, because
+ * that comes from the control endpoint, but not a single transport packet
+ * arrives: from Enigma2's side the scan says "0 channels found" on a
+ * transponder that is demonstrably live.
+ *
+ * This matters most right after the blind-scan helper has run: it opens the
+ * adapter, tunes across the band and closes again, so the endpoint is left
+ * stalled exactly when Enigma2 reopens it to scan the frequencies the helper
+ * just reported.
+ *
+ * -EPIPE / -ENOENT here just mean the endpoint was not halted, which is the
+ * normal case on a receiver that has only been playing.
+ */
+static void icast_clear_stream_halt(struct icast_state *priv, const char *where)
+{
+	int ret;
+
+	ret = usb_clear_halt(priv->dev->udev,
+			     usb_rcvbulkpipe(priv->dev->udev,
+					     SMIT_BULK_ENDPOINT_STREAM));
+	DLOG("%s: clear halt on stream endpoint -> %d\n", where, ret);
+}
+
 static int icast_fe_init(struct dvb_frontend *fe)
 {
 	struct icast_state *priv = fe->demodulator_priv;
@@ -76,6 +107,8 @@ static int icast_fe_init(struct dvb_frontend *fe)
 	priv->lock = 0;
 	priv->strength = 0;
 	priv->snr = 0;
+
+	icast_clear_stream_halt(priv, "init");
 
 	return 0;
 }
@@ -136,6 +169,49 @@ static int icast_fe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_pr
  *   24..27  QAM order (16/32/64/128/256) for DVB-C
  *   28..31  bandwidth, DTMB only
  */
+/*
+ * Throw away whatever transport packets are still sitting in the dongle's
+ * bulk-in FIFO after a retune.
+ *
+ * The firmware never flushes that FIFO when the host stops the stream
+ * (usb_urb_kill), and it keeps outputting the previous mux into it until
+ * the host drains the pipe.  A fresh tune therefore starts with a tail of
+ * the OLD frequency, and the first PAT a reader sees belongs to the
+ * previous transponder.  The blind-scan helper drains explicitly before it
+ * judges a frequency, but Enigma2 starts its section filters right after
+ * the tune and trusts the first PAT -- so its scan records the previous
+ * transponder's services under the new frequency.  Draining here (only
+ * while dvb-usb is not streaming, since then the URBs own the endpoint)
+ * makes the first PAT after a tune a genuine one.
+ */
+static void icast_drain_stale_ts(struct icast_state *priv)
+{
+	u8 *buf;
+	int total = 0, iter;
+
+	if (priv->dev->adapter[0].feedcount > 0)
+		return;
+
+	buf = kmalloc(4096, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	for (iter = 0; iter < 128 && total < 512 * 1024; iter++) {
+		int len = 4096;
+		int ret = usb_bulk_msg(priv->dev->udev,
+				       usb_rcvbulkpipe(priv->dev->udev,
+						       SMIT_BULK_ENDPOINT_STREAM),
+				       buf, len, &len, 20);
+
+		if (ret < 0 || len == 0)
+			break;
+		total += len;
+	}
+	if (total)
+		DLOG("drained %d bytes of stale TS after tune\n", total);
+	kfree(buf);
+}
+
 static int icast_fe_set_frontend(struct dvb_frontend *fe)
 {
   u8 cmd9[32] = {
@@ -157,6 +233,20 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
        (unsigned)fe->dtv_property_cache.frequency,
        (unsigned)fe->dtv_property_cache.symbol_rate,
        (int)fe->dtv_property_cache.modulation);
+
+  /*
+   * Re-arm the transport-stream endpoint here, not only in init().
+   *
+   * Enigma2 keeps the frontend open for its whole lifetime, so init() runs
+   * once at boot and never again -- a stall picked up later stays until the
+   * next reboot.  set_frontend() is the one hook that runs for every
+   * transponder, and it runs before Enigma2 starts its section filters, so
+   * un-stalling here is what makes the feed below actually deliver packets.
+   * Without it the first transponder after the blind-scan helper always
+   * scans empty; the following ones only work because closing and reopening
+   * the demux happens to clear the condition as a side effect.
+   */
+  icast_clear_stream_halt(priv, "set_frontend");
 
   mutex_lock(&priv->io_lock);
 
@@ -227,6 +317,12 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   priv->lock = 0;
   if (smit_tuner_stat(priv->dev->udev, buf, 2) >= 32)
     priv->lock = buf[29] ? 1 : 0;
+
+  /*
+   * The status read above gave the firmware a moment to settle; whatever
+   * the bulk-in FIFO still holds now belongs to the previous transponder.
+   */
+  icast_drain_stale_ts(priv);
 
   DLOG("set_frontend: accepted, freq_khz=%u sr_ksps=%u post_tune_lock=%d\n",
        (unsigned)(frequency), (unsigned)(fe->dtv_property_cache.symbol_rate / 1000),

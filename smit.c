@@ -249,9 +249,20 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   smit_tuner_stat(udev, buf, 0);
 
   smit_set(udev, 0xA0, cmd14, 20, 100);
-  smit_tuner_stat(udev, buf, 0);
-  
-  *dtmb = strstr(buf + 18, "DTMB:Y") != NULL;
+  ret = smit_tuner_stat(udev, buf, 0);
+
+  /*
+   * Only read the capability string out of a reply that actually arrived
+   * after the GDHW query.  smit_tuner_stat() copies into buf without
+   * clearing it, so a short or missing reply leaves the answer of an
+   * earlier query in place -- after a warm reboot that was the DTMB:Y
+   * capability line, which flipped the frontend label to FE_OFDM and made
+   * Enigma2 treat this cable tuner as DVB-T (no scan list, no playback).
+   */
+  if (ret >= 20)
+    *dtmb = strstr(buf + 18, "DTMB:Y") != NULL;
+  else
+    *dtmb = 0;
 
   if (!*dtmb)
   {

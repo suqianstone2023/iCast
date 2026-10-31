@@ -49,10 +49,10 @@ MODULE_PARM_DESC(smit_async,
  * just how it is labelled.  set_frontend() already dispatches on the
  * delivery system, so cable tuning works either way.
  */
-static char *icast_mode = "auto";
+static char *icast_mode = "dvbc";
 module_param(icast_mode, charp, 0444);
 MODULE_PARM_DESC(icast_mode,
-	"frontend type: auto (as reported by the dongle), dvbc (FE_QAM), dtmb (FE_OFDM)");
+	"frontend type: dvbc (FE_QAM, default -- this stick is used on cable), auto (as reported by the dongle), dtmb (FE_OFDM)");
 
 /*
  * The MCU answers the initialisation handshake exactly once per power cycle
