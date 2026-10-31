@@ -208,9 +208,33 @@ dmesg | grep -i icast      # 应看到 successfully initialized and connected
 | `kapi/` | 内核私有头文件副本（本仓库新增） |
 | `dkms.conf`、`install.sh`、`uninstall.sh` | DKMS 安装与卸载（本仓库新增） |
 | `tools/icast-libusb/` | 用户态驱动，不依赖内核（本仓库新增） |
+| `e2/` | Enigma2 接收机侧的扫描器、插件、部署脚本与记录（本仓库新增） |
+| `Makefile.e2` | 针对 4.4.35 厂商内核的交叉编译入口（本仓库新增） |
+
+## 在 Enigma2 接收机上用
+
+GigaBlue UHD Trio 4K（Hi3798MV200 / ARMv7 / 内核 4.4.35）+ OpenBH 5.6 上整条链路是通的：
+界面里出现一个 DVB-C 调谐器，能手动调台，也能走 E2 自己的自动扫描把频道存进 lamedb。
+
+跟发行版用法不一样的地方只有一处——**E2 不会重新打开前端**，它开机就把
+`adapter1/frontend0` 攥在手里，所以任何「在 open() 里做设备复位」的想法都会失效，复位只能
+放到 `set_frontend()` 里去。另外 E2 对 USB tuner 有硬门槛：`frontend0` 之外还得有
+`/dev/misc/vtunerN`，两个都有它才认这个 adapter。
+
+`e2/` 目录放着让它真正好用的那部分东西，入口是 [`e2/README.md`](e2/README.md)：
+
+- `e2/tools/tda1002x.c`：E2 调用的扫描器（E2 会 `execute()` 它并解析输出）
+- `e2/tools/ScanFilter-plugin.py`：扫描存盘时剔掉广播 / 数据业务的 E2 插件
+- `e2/E2-INTEGRATION.md`：E2 枚举 USB tuner 的源码级分析，解释了为什么必须设 `FE_QAM`
+- `e2/BUILD-KERNEL-MODULE.md`：用 4.4.35 源码树交叉编译的完整步骤
 
 ## 已知问题
 
+- **E2 上 `icast_mode` 默认必须是 `dvbc`**。热重启后固件状态缓冲里可能还留着上一轮的
+  `DTMB:Y`，读到就会把前端翻成 `FE_OFDM`，E2 当 DVB-T 处理，扫完是空列表、画面全黑。
+  装载时显式给 `icast_mode=dvbc` 更保险。
+- **棒子停流后不清 bulk-in FIFO**。上一个频点的 TS 会残留，E2 拿到的第一张 PAT 属于旧
+  mux，频道就会认错。驱动在每次 `set_frontend()` 末尾把残留排掉（约 390 KB）才对。
 - **USB ID 固定为 `29df:0001`**。若设备使用其它 PID（部分批次为 `0002`），需修改
   `icast-smit.c` 中的 `USB_PID_SMIT_ICAST` 后重新编译。
 - 编译时提示 `the frame size of 1184 bytes is larger than 1024 bytes`：`smit.c` 在栈上
@@ -222,4 +246,7 @@ dmesg | grep -i icast      # 应看到 successfully initialized and connected
 
 GPL-2.0（见 `LICENSE`）。驱动原始作者：Xiaodong Ni <nxiaodong520@gmail.com>，
 上游仓库：<https://github.com/nxdong520/iCast>。
-本仓库仅新增发行版内核的构建与安装方式，驱动实现未做修改。
+本仓库在上游基础上新增了发行版内核的构建与安装方式、4.4.35 厂商内核的交叉编译入口，
+以及 Enigma2 接收机侧的扫描与配套工具；为了让棒子在 E2 里能被当作真 tuner 使用，
+驱动实现本身也做了一些修改（前端类型、锁定状态读取、调台后的 FIFO 清理），
+逐条写在对应的提交说明里。
